@@ -9,77 +9,69 @@ Layer 3 adds monitoring and automated response to cache issues. This complements
 
 ---
 
-## Current Logging State
+## Phase 1: Enhanced Logging (IMPLEMENTED)
 
-### What's Already Logged
-
-**Log file**: `/data/logs/access.log`
-
-**Format** (`cachelog`):
-```
-[$cacheidentifier] $remote_addr / $http_x_forwarded_for - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" "$upstream_cache_status" "$host" "$http_range"
-```
-
-**Key variables available**:
-| Variable | Description | Values |
-|----------|-------------|--------|
-| `$upstream_cache_status` | Cache hit/miss status | HIT, MISS, EXPIRED, STALE, BYPASS, REVALIDATED, UPDATING |
-| `$status` | HTTP response status | 200, 206, 502, etc. |
-| `$body_bytes_sent` | Response size | bytes |
-| `$http_range` | Range request header | bytes=0-1048575 |
-
-### What's Missing for Error Detection
-
-The current log format doesn't capture:
-- `$upstream_status` - Actual status from upstream (critical for detecting failures)
-- `$upstream_response_time` - How long upstream took
-- `$upstream_response_length` - Bytes received from upstream
-- `$request_time` - Total request processing time
-
----
-
-## Phase 1: Enhanced Logging
-
-### 1.1 Add Error-Detection Variables to Log Format
+### Log Format Changes
 
 **File**: `overlay/etc/nginx/conf.d/10_log_format.conf`
 
-Add new log format that captures upstream errors:
+Added 4 upstream variables to existing formats (no new formats needed):
 
-```nginx
-# Enhanced format with upstream error details for cache health monitoring
-log_format cachelog-health '[$cacheidentifier] $remote_addr [$time_local] '
-    '"$request" $status/$upstream_status $body_bytes_sent/$upstream_response_length '
-    '"$upstream_cache_status" $request_time/$upstream_response_time '
-    '"$host" "$http_range"';
+| Variable | Purpose |
+|----------|---------|
+| `$upstream_status` | HTTP status from origin (detect 5xx errors) |
+| `$upstream_response_length` | Bytes from origin (detect truncation) |
+| `$request_time` | Total request processing time |
+| `$upstream_response_time` | Time waiting for upstream |
 
-# JSON version for structured log analysis
-log_format cachelog-health-json escape=json '{'
-    '"timestamp":"$msec",'
-    '"cache_identifier":"$cacheidentifier",'
-    '"remote_addr":"$remote_addr",'
-    '"request":"$request_method $request_uri",'
-    '"status":$status,'
-    '"upstream_status":"$upstream_status",'
-    '"bytes_sent":$body_bytes_sent,'
-    '"upstream_bytes":"$upstream_response_length",'
-    '"cache_status":"$upstream_cache_status",'
-    '"request_time":$request_time,'
-    '"upstream_time":"$upstream_response_time",'
-    '"host":"$host",'
-    '"range":"$http_range"'
-'}';
+**Updated `cachelog` format**:
+```
+[$cacheidentifier] $remote_addr / $http_x_forwarded_for - $remote_user [$time_local]
+"$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"
+"$upstream_cache_status" "$host" "$http_range"
+"$upstream_status" $upstream_response_length $request_time $upstream_response_time
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                   NEW: upstream error detection fields
 ```
 
-**Key additions**:
-- `$upstream_status` - Detect 5xx errors, timeouts
-- `$upstream_response_length` - Compare with `$body_bytes_sent` to detect truncation
-- `$upstream_response_time` - Identify slow upstreams
-- `$request_time` - Total time including cache operations
+**Updated `cachelog-json` format** (new fields):
+```json
+{
+  ...existing fields...,
+  "upstream_status": "$upstream_status",
+  "upstream_bytes": "$upstream_response_length",
+  "request_time": $request_time,
+  "upstream_time": "$upstream_response_time"
+}
+```
 
-### 1.2 Separate Error Log for Analysis
+### What Logs Now Show
 
-Create a dedicated log for cache errors only:
+```
+NORMAL REQUEST (cache hit):
+[steam] 192.168.1.50 [...] "GET /depot/123/chunk/abc" 200 1048576 ... "HIT" ... "-" - 0.001 -
+                                                                       ^^^       ^^^^^^^^
+                                                                       Cache hit, no upstream
+
+NORMAL REQUEST (cache miss, successful fetch):
+[steam] 192.168.1.50 [...] "GET /depot/123/chunk/abc" 200 1048576 ... "MISS" ... "200" 1048576 0.523 0.521
+                                                          ^^^^^^^                 ^^^ ^^^^^^^
+                                                          Full 1MB                OK  Full 1MB from upstream
+
+ERROR: Truncated response:
+[steam] 192.168.1.50 [...] "GET /depot/123/chunk/abc" 200 524288 ... "MISS" ... "200" 524288 30.5 30.2
+                                                         ^^^^^^                       ^^^^^^
+                                                         Only 512KB sent!             Only 512KB from upstream!
+
+ERROR: Upstream failure:
+[steam] 192.168.1.50 [...] "GET /depot/123/chunk/abc" 502 0 ... "MISS" ... "502" 0 0.5 0.5
+                                                     ^^^                   ^^^
+                                                     Bad gateway           Upstream returned 502
+```
+
+### Optional: Separate Error Log (Future Enhancement)
+
+Could add conditional logging for errors only:
 
 ```nginx
 # In 10_cache.conf, add conditional logging for errors
@@ -101,10 +93,10 @@ map "$log_cache_error:$log_http_error" $is_error {
 }
 
 # Then in server block:
-access_log /data/logs/cache-errors.log cachelog-health if=$is_error;
+access_log /data/logs/cache-errors.log cachelog if=$is_error;
 ```
 
-This creates `/data/logs/cache-errors.log` with ONLY problematic requests.
+This would create `/data/logs/cache-errors.log` with ONLY problematic requests.
 
 ---
 
@@ -514,7 +506,13 @@ done
 
 ## Implementation Summary
 
-### Files to Create
+### Already Implemented ✓
+
+| File | Changes |
+|------|---------|
+| `overlay/etc/nginx/conf.d/10_log_format.conf` | Added upstream error variables to existing formats |
+
+### Files to Create (Future)
 
 | File | Purpose |
 |------|---------|
@@ -524,12 +522,6 @@ done
 | `overlay/scripts/cache-health-daemon.sh` | Automated background remediation |
 | `overlay/scripts/cache-metrics.sh` | Prometheus-format metrics |
 | `overlay/etc/supervisor/conf.d/cache-health.conf` | Supervisor config for daemon |
-
-### Files to Modify
-
-| File | Changes |
-|------|---------|
-| `overlay/etc/nginx/conf.d/10_log_format.conf` | Add health-focused log formats |
 
 ---
 
@@ -594,18 +586,16 @@ vs. Current: Hours/days until manual discovery and cleanup
 
 ---
 
-## Questions Before Implementation
+## Questions Before Implementation (Scripts)
 
 1. **Enable daemon by default?**
    - Pro: Automatic protection
    - Con: New feature, may have edge cases
+   - Recommend: `autostart=false`, users opt-in
 
 2. **Default to DRY_RUN=true or false?**
    - Recommend: DRY_RUN=true initially, users opt-in to auto-deletion
 
-3. **Add new log format as default or optional?**
-   - The enhanced format adds more fields, slightly larger logs
-
-4. **Prometheus metrics endpoint?**
+3. **Prometheus metrics endpoint?**
    - Useful for external monitoring (Grafana, etc.)
-   - Adds complexity
+   - Adds complexity - maybe separate PR
