@@ -11,6 +11,8 @@
 #   CHECK_INTERVAL    - Seconds between checks (default: 300)
 #   LOG_FILE          - Path to access log (default: /data/logs/access.log)
 #   CACHE_DIR         - Path to cache directory (default: /data/cache/cache)
+#   MAX_SCAN_FILES    - Maximum cache files to scan per remediation (default: 100000)
+#   PARALLEL_JOBS     - Number of parallel workers for cache search (default: CPU count)
 
 set -e
 
@@ -22,6 +24,8 @@ CONFIRM_THRESHOLD="${CONFIRM_THRESHOLD:-3}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-300}"
 DRY_RUN="${DRY_RUN:-true}"
 DAEMON_LOG="${DAEMON_LOG:-/data/logs/cache-health-daemon.log}"
+MAX_SCAN_FILES="${MAX_SCAN_FILES:-100000}"
+PARALLEL_JOBS="${PARALLEL_JOBS:-$(nproc)}"
 
 # Ensure state directory exists
 mkdir -p "$STATE_DIR"
@@ -96,6 +100,55 @@ analyze_logs() {
     ' "$LOG_FILE" 2>/dev/null
 }
 
+# Optimized cache file search using parallel processing
+search_and_delete_cache_files() {
+    local uri="$1"
+    local start_time=$(date +%s)
+
+    # Use parallel search with xargs
+    local removed=0
+    local scanned=0
+
+    log "Searching cache (max $MAX_SCAN_FILES files with $PARALLEL_JOBS workers)..."
+
+    # Worker function for parallel search
+    local worker_code='
+    uri_pattern="$1"
+    shift
+    for file in "$@"; do
+        if head -c 2000 "$file" 2>/dev/null | head -3 | grep -qF "$uri_pattern"; then
+            echo "$file"
+        fi
+    done
+    '
+
+    # Find and delete matching cache files in parallel
+    local found_files
+    found_files=$(find "$CACHE_DIR" -type f 2>/dev/null | head -n "$MAX_SCAN_FILES" | \
+        ionice -c2 -n7 nice -n15 \
+        xargs -P "$PARALLEL_JOBS" -n 100 bash -c "$worker_code" _ "$uri" 2>/dev/null || true)
+
+    if [ -n "$found_files" ]; then
+        while IFS= read -r file; do
+            if [ -n "$file" ]; then
+                if rm -f "$file" 2>/dev/null; then
+                    ((removed++))
+                    log "  REMOVED: $file"
+                else
+                    log_error "  Failed to remove: $file"
+                fi
+            fi
+        done <<< "$found_files"
+    fi
+
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+
+    log "Search complete in ${elapsed}s: removed $removed files"
+
+    return $removed
+}
+
 # Check if URI should be remediated
 check_and_remediate() {
     local uri="$1"
@@ -123,25 +176,30 @@ check_and_remediate() {
         if [ "$DRY_RUN" == "true" ]; then
             log "DRY RUN: Would search and delete cache files for: $uri"
 
-            # Still do the search to show what would happen
-            local count=$(find "$CACHE_DIR" -type f -exec sh -c 'head -c 2000 "$1" 2>/dev/null | head -3 | grep -q "$2" && echo found' _ {} "$uri" \; 2>/dev/null | wc -l)
-            log "DRY RUN: Would delete approximately $count cache files"
+            # Quick estimate using parallel search
+            local start_time=$(date +%s)
+            local count=$(find "$CACHE_DIR" -type f 2>/dev/null | head -n "$MAX_SCAN_FILES" | \
+                xargs -P "$PARALLEL_JOBS" -n 100 sh -c '
+                    for f in "$@"; do
+                        head -c 2000 "$f" 2>/dev/null | head -3 | grep -qF "$1" && echo 1
+                    done
+                ' _ "$uri" 2>/dev/null | wc -l)
+            local end_time=$(date +%s)
+            local elapsed=$((end_time - start_time))
+
+            log "DRY RUN: Would delete approximately $count cache files (scanned in ${elapsed}s)"
         else
             log "Searching for cache files matching: $uri"
 
-            local removed=0
-            while IFS= read -r file; do
-                if head -c 2000 "$file" 2>/dev/null | head -3 | grep -q "$uri"; then
-                    if rm -f "$file" 2>/dev/null; then
-                        ((removed++))
-                        log "REMOVED: $file"
-                    else
-                        log_error "Failed to remove: $file"
-                    fi
-                fi
-            done < <(find "$CACHE_DIR" -type f 2>/dev/null)
+            search_and_delete_cache_files "$uri"
+            local removed=$?
 
             log "Remediation complete: removed $removed cache files for: $uri"
+
+            # Suggest nginx reload if files were actually removed
+            if [ "$removed" -gt 0 ]; then
+                log "NOTE: Consider reloading nginx to clear internal cache metadata"
+            fi
         fi
 
         # Reset state after remediation
@@ -152,7 +210,10 @@ check_and_remediate() {
 # Clean up old state files (issues that resolved themselves)
 cleanup_old_state() {
     # Remove state files older than 1 hour
-    find "$STATE_DIR" -type f -mmin +60 -delete 2>/dev/null || true
+    local cleaned=$(find "$STATE_DIR" -type f -mmin +60 -delete -print 2>/dev/null | wc -l)
+    if [ "$cleaned" -gt 0 ]; then
+        log "Cleaned up $cleaned old state files"
+    fi
 }
 
 # Main daemon loop
@@ -168,6 +229,8 @@ main() {
     log "  ERROR_THRESHOLD:   $ERROR_THRESHOLD"
     log "  CONFIRM_THRESHOLD: $CONFIRM_THRESHOLD"
     log "  CHECK_INTERVAL:    ${CHECK_INTERVAL}s"
+    log "  MAX_SCAN_FILES:    $MAX_SCAN_FILES"
+    log "  PARALLEL_JOBS:     $PARALLEL_JOBS"
     log "  DRY_RUN:           $DRY_RUN"
     log ""
 
@@ -176,6 +239,7 @@ main() {
         log "   Set DRY_RUN=false to enable automatic deletion"
     else
         log "⚠️  LIVE MODE - Cache files WILL be deleted automatically"
+        log "   I/O throttling enabled (ionice -c2 -n7, nice -n15)"
     fi
     log ""
 
@@ -190,25 +254,45 @@ main() {
         exit 1
     fi
 
+    # Count total cache files for context
+    local total_cache=$(find "$CACHE_DIR" -type f 2>/dev/null | wc -l)
+    log "Total cache files at startup: $total_cache"
+    if [ "$total_cache" -gt "$MAX_SCAN_FILES" ]; then
+        log "NOTE: Cache exceeds MAX_SCAN_FILES limit - scans will be limited"
+    fi
+    log ""
+
     # Main loop
     while true; do
         log "────────────────────────────────────────────────────────────────────"
         log "Starting health check cycle..."
+        local cycle_start=$(date +%s)
 
         if [ -f "$LOG_FILE" ]; then
+            local suspect_count=0
+
             # Analyze logs and get problematic URIs
             while IFS=$'\t' read -r uri error_count error_type; do
                 if [ -n "$uri" ]; then
+                    ((suspect_count++))
                     check_and_remediate "$uri" "$error_count" "$error_type"
                 fi
             done < <(analyze_logs)
+
+            if [ "$suspect_count" -eq 0 ]; then
+                log "✓ No suspect URIs detected in this cycle"
+            else
+                log "Processed $suspect_count suspect URI(s)"
+            fi
 
             cleanup_old_state
         else
             log "Log file not yet available, skipping analysis"
         fi
 
-        log "Health check complete. Sleeping ${CHECK_INTERVAL}s..."
+        local cycle_end=$(date +%s)
+        local cycle_time=$((cycle_end - cycle_start))
+        log "Health check complete in ${cycle_time}s. Sleeping ${CHECK_INTERVAL}s..."
         sleep "$CHECK_INTERVAL"
     done
 }

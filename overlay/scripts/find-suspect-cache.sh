@@ -4,6 +4,10 @@
 #
 # Usage: find-suspect-cache.sh [hours_to_lookback]
 # Example: find-suspect-cache.sh 24
+#
+# Note: This script parses the text log format. For more robust parsing,
+# consider using jq to parse the JSON log format instead:
+#   jq -r 'select(.upstream_cache_status=="MISS" and .upstream_status=="502")' access.json.log
 
 set -e
 
