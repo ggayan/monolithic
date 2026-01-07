@@ -59,11 +59,22 @@ analyze_logs() {
     # 1. Upstream 5xx errors with MISS (might have cached bad response)
     # 2. Zero-byte responses
     # 3. STALE responses (background update might be failing)
+    #
+    # Note: We scan recent log entries using tail to limit scope.
+    # For more precise time filtering, use JSON log format with $msec field.
 
-    awk -v threshold="$ERROR_THRESHOLD" '
+    # Estimate lines to scan based on CHECK_INTERVAL
+    # Assume ~10 requests/sec max = 600 lines per minute
+    local lines_to_scan=$((CHECK_INTERVAL * 10))
+    [ "$lines_to_scan" -lt 1000 ] && lines_to_scan=1000
+    [ "$lines_to_scan" -gt 50000 ] && lines_to_scan=50000
+
+    tail -n "$lines_to_scan" "$LOG_FILE" 2>/dev/null | \
+    awk -v threshold="$ERROR_THRESHOLD" -v cutoff="$cutoff" '
     {
-        # Extract URI from request field
-        if(match($0, /"(GET|HEAD|POST) ([^"]+)"/, arr)) {
+        # Extract URI from request field (match up to space before HTTP version)
+        # Example: "GET /path/to/file HTTP/1.1" -> captures "/path/to/file"
+        if(match($0, /"(GET|HEAD|POST) ([^ ]+) /, arr)) {
             uri = arr[2]
             # Remove query string for grouping
             gsub(/\?.*$/, "", uri)
@@ -97,7 +108,7 @@ analyze_logs() {
             }
         }
     }
-    ' "$LOG_FILE" 2>/dev/null
+    ' 2>/dev/null
 }
 
 # Optimized cache file search using parallel processing
@@ -146,7 +157,9 @@ search_and_delete_cache_files() {
 
     log "Search complete in ${elapsed}s: removed $removed files"
 
-    return $removed
+    # Output count to stdout (not as return code to avoid issues with set -e)
+    echo "$removed"
+    return 0
 }
 
 # Check if URI should be remediated
@@ -191,8 +204,8 @@ check_and_remediate() {
         else
             log "Searching for cache files matching: $uri"
 
-            search_and_delete_cache_files "$uri"
-            local removed=$?
+            # Capture count from stdout (function outputs count, not return code)
+            local removed=$(search_and_delete_cache_files "$uri")
 
             log "Remediation complete: removed $removed cache files for: $uri"
 

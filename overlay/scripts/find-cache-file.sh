@@ -135,15 +135,22 @@ fi
 # Parallel search using xargs
 # Process files in batches to reduce overhead
 echo "Scanning cache files..."
-if [ "$MAX_FILES" -gt 0 ]; then
-    FIND_CMD="find '$CACHE_DIR' -type f 2>/dev/null | head -n $MAX_FILES"
-else
-    FIND_CMD="find '$CACHE_DIR' -type f 2>/dev/null"
-fi
 
-eval "$FIND_CMD" | \
-    $CMD_PREFIX xargs -P "$PARALLEL_JOBS" -n "$BATCH_SIZE" bash -c \
-        'search_worker "$@"' _ "$PATTERN" > "$RESULTS_FILE"
+# Apply I/O throttling to entire pipeline (find + xargs)
+# This ensures even directory traversal is throttled
+if [ "$MAX_FILES" -gt 0 ]; then
+    $CMD_PREFIX sh -c "
+        find '$CACHE_DIR' -type f 2>/dev/null | head -n $MAX_FILES | \
+        xargs -P $PARALLEL_JOBS -n $BATCH_SIZE bash -c \
+            'search_worker \"\$@\"' _ '$PATTERN'
+    " > "$RESULTS_FILE"
+else
+    $CMD_PREFIX sh -c "
+        find '$CACHE_DIR' -type f 2>/dev/null | \
+        xargs -P $PARALLEL_JOBS -n $BATCH_SIZE bash -c \
+            'search_worker \"\$@\"' _ '$PATTERN'
+    " > "$RESULTS_FILE"
+fi
 
 # Read results
 mapfile -t found_files < "$RESULTS_FILE"

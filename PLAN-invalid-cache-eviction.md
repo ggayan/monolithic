@@ -1052,3 +1052,124 @@ echo "Mitigation: [what you did]" >> /tmp/rollback-$(date +%Y%m%d).txt
    - Troubleshooting section needed (add based on real-world issues)
 
 **Recommended deployment:** Gradual rollout with active monitoring, starting with DRY_RUN=true for validation.
+
+---
+
+## Note on proxy_next_upstream with Single Upstream
+
+### Configuration Context
+
+The implementation uses:
+```nginx
+proxy_pass http://127.0.0.1:3128$request_uri;
+proxy_next_upstream error timeout http_404 http_500 http_502 http_503 http_504 invalid_header;
+proxy_next_upstream_tries 3;
+```
+
+This passes to a **single endpoint** (127.0.0.1:3128), not an upstream group with multiple servers.
+
+### How Retries Work
+
+**Common Misconception:** "proxy_next_upstream only works with multiple upstream servers"
+
+**Reality:** nginx will still retry even with a single upstream, with these behaviors:
+
+1. **Transient Failures:**  
+   - Network blips, temporary connection issues → nginx retries same endpoint
+   - Service restart/reload → retries can succeed after service comes back up
+   - TCP connection failures → retry can succeed on new connection
+
+2. **What proxy_next_upstream Does:**
+   - Defines conditions that trigger retry logic
+   - `invalid_header` catches incomplete/malformed responses
+   - `error timeout` handles connection failures and timeouts
+   - `http_5xx` retries on server errors
+
+3. **What proxy_next_upstream_tries Does:**
+   - Limits total retry attempts (prevents infinite loops)
+   - With single upstream: tries same endpoint up to N times
+   - With multiple upstreams: tries different servers
+
+### Value for Single Upstream
+
+Even with one upstream, this configuration provides:
+
+✅ **Retry on transient network issues**  
+✅ **Retry on incomplete responses** (invalid_header)  
+✅ **Retry after upstream restart** (502/503 during reload)  
+✅ **Protection against partial cache** (failed request won't cache with retries)
+
+### Testing Recommendations
+
+To verify retry behavior:
+
+```bash
+# Test 1: Simulate upstream restart
+# Terminal 1: watch nginx access log
+tail -f /data/logs/access.log | grep upstream_status
+
+# Terminal 2: restart upstream service
+systemctl restart <upstream-service>
+
+# Observe: Should see retries in log (comma-separated upstream_status)
+
+# Test 2: Simulate connection failure
+# Use iptables to briefly block upstream port
+iptables -A OUTPUT -p tcp --dport 3128 -j REJECT
+sleep 2
+iptables -D OUTPUT -p tcp --dport 3128 -j REJECT
+
+# Observe: nginx should retry and eventually succeed or fail cleanly
+```
+
+### Expected Log Output
+
+**Successful retry after transient failure:**
+```
+$upstream_status = "502, 502, 200"  # Failed twice, succeeded on 3rd attempt
+$upstream_response_time = "0.001, 0.001, 0.523"
+```
+
+**All retries exhausted:**
+```
+$upstream_status = "502, 502, 502"  # All 3 attempts failed
+$status = 502  # Client receives error (no partial cache)
+```
+
+### Alternative: Upstream Group
+
+For true load balancing or failover, configure an upstream group:
+
+```nginx
+upstream cache_upstream {
+    server 127.0.0.1:3128 max_fails=2 fail_timeout=30s;
+    # Could add backup servers:
+    # server 127.0.0.1:3129 backup;
+}
+
+proxy_pass http://cache_upstream$request_uri;
+```
+
+This is **not required** for the current use case, where retries to the same endpoint are sufficient.
+
+---
+
+## Monitoring Retry Effectiveness
+
+Track retry success rates in logs:
+
+```bash
+# Count requests with multiple upstream attempts
+grep -E '"[0-9]+, [0-9]+"' /data/logs/access.log | wc -l
+
+# Find successful retries (ended in 200)
+awk '/"[^"]*, 200"/ {print}' /data/logs/access.log
+
+# Find failed retries (all attempts failed)
+awk '/"502, 502, 502"/ {print}' /data/logs/access.log
+```
+
+If retry success rate is low, consider:
+- Increasing `proxy_next_upstream_tries` beyond 3
+- Adjusting `proxy_connect_timeout` / `proxy_read_timeout`
+- Investigating root cause of upstream failures

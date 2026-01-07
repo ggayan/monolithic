@@ -40,7 +40,7 @@ print_stats() {
     local recent_lines="$1"
     local total_lines=$(echo "$recent_lines" | wc -l)
 
-    echo "Last ${total_lines} requests (from last ${CHECK_INTERVAL}s of log activity):"
+    echo "Last ${total_lines} requests (from last 1000 log entries):"
     echo "────────────────────────────────────────────────────────────────────"
     echo ""
 
@@ -86,8 +86,29 @@ print_stats() {
 
     # Response time stats (if available)
     echo "RESPONSE TIMES (from upstream_response_time field):"
-    local slow_requests=$(echo "$recent_lines" | awk '{if($(NF) > 10) count++} END{print count+0}')
-    local very_slow=$(echo "$recent_lines" | awk '{if($(NF) > 30) count++} END{print count+0}')
+    # Note: $upstream_response_time can be comma-separated on retries (e.g., "0.5, 0.3")
+    # Extract last value and handle '-' (no upstream) gracefully
+    local slow_requests=$(echo "$recent_lines" | awk '
+        {
+            time = $(NF)
+            # Extract last numeric value from comma-separated list
+            if(match(time, /[0-9.]+$/)) {
+                time = substr(time, RSTART, RLENGTH)
+                if(time > 10) count++
+            }
+        }
+        END {print count+0}
+    ')
+    local very_slow=$(echo "$recent_lines" | awk '
+        {
+            time = $(NF)
+            if(match(time, /[0-9.]+$/)) {
+                time = substr(time, RSTART, RLENGTH)
+                if(time > 30) count++
+            }
+        }
+        END {print count+0}
+    ')
 
     printf "  %-12s %6d\n" ">10s:" "$slow_requests"
     if [ "$very_slow" -gt 0 ]; then
