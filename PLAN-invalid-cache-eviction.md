@@ -2,536 +2,832 @@
 
 ## Problem Statement
 
-Users currently face corrupt/invalid cache files that require manual cleanup using slow commands like:
+Users encounter corrupt/invalid cache files requiring manual cleanup:
 ```bash
 find /cache -type f -exec awk 'FNR>2 {nextfile} /pattern/ { print FILENAME }' '{}' +
 ```
 
-This happens because nginx can cache partial or corrupt responses when:
-1. Upstream connection drops mid-transfer
-2. Network timeout during slice download
-3. Upstream sends incomplete response with valid headers
-4. nginx restart during active cache population
-
-**Goal**: Configure nginx to prevent corrupt files from being cached in the first place.
+This process takes hours on large caches. The goal is to configure nginx to **minimize** corrupt cache entries through faster detection, retry logic, and self-healing.
 
 ---
 
-## How Slice Caching Works (Background)
+## Background: How Slice Caching Works
 
 ```
-Client Request: GET /game/file.zip (500MB file)
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    NGINX SLICE MODULE                        │
-│  Splits request into 1MB slices (configured via `slice 1m`) │
-└─────────────────────────────────────────────────────────────┘
-                        │
-        ┌───────────────┼───────────────┐
-        ▼               ▼               ▼
-   Slice 0-1MB    Slice 1-2MB    Slice 2-3MB  ... (500 slices)
-        │               │               │
-        ▼               ▼               ▼
-   Cache Key:      Cache Key:      Cache Key:
-   uri+0-1MB       uri+1-2MB       uri+2-3MB
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         CLIENT REQUEST                                   │
+│                  GET /game/update.zip (500MB file)                       │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      NGINX SLICE MODULE                                  │
+│                                                                          │
+│   slice 1m;  ←── Splits file into 1MB chunks                            │
+│                                                                          │
+│   File divided into slices:                                              │
+│   ┌────────┬────────┬────────┬────────┬─────┬────────┐                  │
+│   │ Slice  │ Slice  │ Slice  │ Slice  │ ... │ Slice  │                  │
+│   │ 0-1MB  │ 1-2MB  │ 2-3MB  │ 3-4MB  │     │ 499-500│                  │
+│   └────────┴────────┴────────┴────────┴─────┴────────┘                  │
+│                                                                          │
+│   Each slice has its own cache key:                                      │
+│   proxy_cache_key = $cacheidentifier + $uri + $slice_range              │
+│                                                                          │
+│   Example keys:                                                          │
+│   "steam/game/update.zip/bytes=0-1048575"                               │
+│   "steam/game/update.zip/bytes=1048576-2097151"                         │
+│   "steam/game/update.zip/bytes=2097152-3145727"                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-Each slice is:
-- Independently fetched from upstream
-- Independently cached with its own cache key
-- Independently served to clients
-
-**The corruption problem**: If slice #247 fails mid-download, that specific slice file may contain partial data with valid HTTP headers, and nginx will serve it as if it's complete.
+**Key insight**: Each 1MB slice is independently cached. If ONE slice gets corrupted, only that slice is broken, but it affects every client downloading that file.
 
 ---
 
-## Directive-by-Directive Analysis
+## Layer 1: Nginx Configuration Changes
 
 ### 1. `proxy_socket_keepalive on`
 
-**What it does:**
-Enables TCP keepalive probes on the connection between nginx and upstream servers.
+**What it does**: Enables TCP keepalive probes on connections to upstream servers.
 
-**Current behavior (without it):**
+**Current value**: Not set (disabled)
+**Proposed value**: `on`
+
+#### Scenario: Dead Connection Detection
+
 ```
-nginx ──────────────────────────────── upstream
-         Connection established
+WITHOUT proxy_socket_keepalive:
+═══════════════════════════════════════════════════════════════════════════
 
-         [Upstream silently dies - no FIN/RST sent]
+Timeline:
+─────────────────────────────────────────────────────────────────────────►
 
-nginx ──── waiting... waiting... ──── (dead)
+0s        nginx ◄──────── TCP ESTABLISHED ────────► upstream CDN
+          │                                          │
+          │         Fetching slice 247...            │
+          │◄─────────── 200KB received ─────────────│
+          │                                          │
+15s       │         [UPSTREAM CRASHES]               X
+          │         (no FIN/RST sent - silent death)
+          │
+          │         nginx doesn't know connection
+          │         is dead, keeps waiting...
+          │
+          │         ⏳ waiting...
+          │         ⏳ waiting...
+          │         ⏳ waiting...
+          │
+75s       │         proxy_read_timeout expires (60s from last data)
+          │
+          └──────── ERROR detected ─────────────────
+                    (60 seconds wasted)
 
-         [Waits until proxy_read_timeout (default 60s)]
+          ⚠️  Partial 200KB may already be written to cache!
+
+
+WITH proxy_socket_keepalive on:
+═══════════════════════════════════════════════════════════════════════════
+
+Timeline:
+─────────────────────────────────────────────────────────────────────────►
+
+0s        nginx ◄──────── TCP ESTABLISHED ────────► upstream CDN
+          │                                          │
+          │         Fetching slice 247...            │
+          │◄─────────── 200KB received ─────────────│
+          │                                          │
+15s       │         [UPSTREAM CRASHES]               X
+          │         (no FIN/RST sent)
+          │
+20s       │──── TCP KEEPALIVE probe ────►           (no response)
+          │
+25s       │──── TCP KEEPALIVE probe ────►           (no response)
+          │
+30s       │──── TCP KEEPALIVE probe ────►           (no response)
+          │
+35s       └──── CONNECTION DEAD ────────
+                 (detected in ~20s vs 60s)
+
+          ✓ Faster detection = less chance of caching partial data
+          ✓ Clean error triggers retry logic
 ```
 
-When an upstream server crashes, hangs, or has network issues, TCP connections can go "half-open" - nginx thinks the connection is alive but upstream is gone. Without keepalives, nginx waits for the full `proxy_read_timeout` before detecting the failure.
+**Why it helps prevent corrupt cache**:
+- Dead connections detected 2-3x faster
+- Clean connection failure triggers `proxy_next_upstream` retry
+- Smaller window for partial data to be cached
 
-**Behavior with `proxy_socket_keepalive on`:**
-```
-nginx ──────────────────────────────── upstream
-         Connection established
-
-         [Upstream silently dies]
-
-nginx ──── keepalive probe ─────────── (no response)
-nginx ──── keepalive probe ─────────── (no response)
-
-         [Connection marked dead much faster]
-         [nginx can retry or fail cleanly]
-```
-
-TCP keepalive probes (controlled by OS settings, typically every 75s) detect dead connections. This means:
-- Faster detection of dead upstreams
-- Cleaner connection failures (proper error, not timeout)
-- Less chance of partial data being cached
-
-**Impact on corrupt cache prevention:**
-- **Medium-High** - Detects dead connections faster, reducing window for partial writes
-- **Risk**: None - purely beneficial
+**Risk**: None - purely beneficial
 
 ---
 
-### 2. `proxy_read_timeout` (propose: 150s, default: 60s)
+### 2. `proxy_connect_timeout 10s`
 
-**What it does:**
-Maximum time nginx waits for upstream to send data. If no data received within this window, connection is closed with error.
+**What it does**: Maximum time nginx waits to establish TCP connection to upstream.
 
-**Current behavior (default 60s):**
+**Current value**: 60s (nginx default)
+**Proposed value**: 10s
+
+#### Scenario: Unreachable Upstream
+
 ```
-Timeline for stuck 1MB slice download:
+WITHOUT explicit timeout (default 60s):
+═══════════════════════════════════════════════════════════════════════════
 
-0s   ─── Request sent to upstream
-5s   ─── First 100KB received
-10s  ─── Another 200KB received
-15s  ─── Connection stalls (upstream overloaded)
-...
-75s  ─── Still no data (60s timeout from last data)
-75s  ─── nginx closes connection, returns error
+Timeline:
+─────────────────────────────────────────────────────────────────────────►
+
+0s        nginx ─── SYN ───────────────────────────► upstream CDN
+                                                     (unreachable/down)
+
+          ⏳ waiting for SYN-ACK...
+          ⏳ waiting...
+          ⏳ waiting...
+          ⏳ waiting...
+
+60s       nginx ─── TIMEOUT ───────
+          │
+          └──► Error returned to client
+               (client waited 60 seconds for nothing)
+
+
+WITH proxy_connect_timeout 10s:
+═══════════════════════════════════════════════════════════════════════════
+
+Timeline:
+─────────────────────────────────────────────────────────────────────────►
+
+0s        nginx ─── SYN ───────────────────────────► upstream CDN
+                                                     (unreachable/down)
+
+          ⏳ waiting for SYN-ACK...
+
+10s       nginx ─── TIMEOUT ───────
+          │
+          └──► proxy_next_upstream triggers
+               │
+               └──► Retry attempt (if configured)
+                    OR clean error to client
+
+          ✓ 6x faster failure detection
+          ✓ Client doesn't wait forever
+          ✓ Faster retry cycle
 ```
 
-**Why 150s for lancache:**
-Game CDNs can be slow, especially during peak times (game launches, LAN parties). 60s is reasonable but 150s provides headroom for:
-- Slow CDN responses during high load
-- Large file downloads from distant servers
-- Burst traffic scenarios
+**Why it helps prevent corrupt cache**:
+- Doesn't directly prevent corruption
+- Speeds up the failure/retry cycle
+- If upstream is having issues, we find out faster
 
-**Trade-off considerations:**
-- Too short (30s): May timeout legitimate slow downloads
-- Too long (300s+): Delays detection of truly stuck connections
-- 150s: Balance between reliability and fast failure detection
-
-**Impact on corrupt cache prevention:**
-- **Medium** - Ensures stuck connections are killed, triggering retry logic
-- **Risk**: Low - may need tuning based on real-world CDN performance
+**Risk**: Very low - if CDN can't accept connection in 10s, it's effectively down anyway
 
 ---
 
-### 3. `proxy_connect_timeout` (propose: 10s, default: 60s)
+### 3. `proxy_read_timeout 150s`
 
-**What it does:**
-Maximum time nginx waits to establish a TCP connection to upstream.
+**What it does**: Maximum time nginx waits between receiving data chunks from upstream.
 
-**Current behavior (default 60s):**
+**Current value**: 60s (nginx default)
+**Proposed value**: 150s
+
+#### Scenario: Slow CDN Response
+
 ```
-nginx ─── SYN ──────────────────────── upstream (unreachable)
-         [Waits 60 seconds]
-         Connection failed
+WHY NOT KEEP DEFAULT 60s?
+═══════════════════════════════════════════════════════════════════════════
+
+Problem scenario - Game launch day, CDN under heavy load:
+
+0s        nginx ─── GET /game/slice_247 ──────────► upstream CDN
+          │                                          │
+          │◄────────── 100KB received ──────────────│
+          │                                          │
+30s       │◄────────── 200KB received ──────────────│  (CDN is slow)
+          │                                          │
+60s       │         (no data for 30s)                │
+          │                                          │
+          X─── TIMEOUT! ───                          │
+              (but CDN was about to send more data!)
+
+          ⚠️ False timeout - legitimate slow download killed
+
+
+WHY NOT SET VERY HIGH (e.g., 600s)?
+═══════════════════════════════════════════════════════════════════════════
+
+Problem scenario - Upstream connection genuinely stuck:
+
+0s        nginx ─── GET /game/slice_247 ──────────► upstream CDN
+          │                                          │
+          │◄────────── 500KB received ──────────────│
+          │                                          │
+10s       │         [CONNECTION STUCK]               │
+          │         (upstream frozen, not dead)      │
+          │                                          │
+          │         ⏳ waiting...                    │
+          │         ⏳ waiting...                    │
+          │         ⏳ waiting...                    │
+          │                                          │
+610s      X─── TIMEOUT after 10 MINUTES ────
+
+          ⚠️ Client and other requests blocked for 10 minutes
+          ⚠️ Partial 500KB likely cached as "valid"
+
+
+150s - THE BALANCE:
+═══════════════════════════════════════════════════════════════════════════
+
+                    ┌─────────────────────────────────────┐
+                    │     150 seconds = 2.5 minutes       │
+                    │                                     │
+                    │  ✓ Long enough for slow CDNs        │
+                    │  ✓ Short enough to detect stuck     │
+                    │    connections reasonably fast      │
+                    │                                     │
+                    │  For 1MB slice:                     │
+                    │  - Normal: < 10s                    │
+                    │  - Slow CDN: 30-60s                 │
+                    │  - Very slow: 60-120s               │
+                    │  - Stuck: detected at 150s          │
+                    └─────────────────────────────────────┘
 ```
 
-**With 10s timeout:**
-```
-nginx ─── SYN ──────────────────────── upstream (unreachable)
-         [Waits 10 seconds]
-         Connection failed → triggers proxy_next_upstream
-```
+**Why it helps prevent corrupt cache**:
+- Kills genuinely stuck downloads that would otherwise hang indefinitely
+- Triggers retry logic sooner
+- Balances tolerance for slow CDNs with detection of problems
 
-**Why 10s is sufficient:**
-- TCP connection establishment should be fast (< 1s typically)
-- If a CDN can't accept connection in 10s, it's likely down
-- Faster failure = faster retry to alternate resolution
-
-**Impact on corrupt cache prevention:**
-- **Low-Medium** - Doesn't directly prevent corruption, but speeds up failure/retry cycle
-- **Risk**: Very low - 10s is generous for connection establishment
+**Risk**: Low - may need adjustment based on real-world CDN performance
 
 ---
 
-### 4. `proxy_cache_lock_age` (propose: 30s, current: 2m)
+### 4. `proxy_cache_lock_age 30s` (Currently: 2m)
 
-**What it does:**
-When cache lock is enabled, only one request fetches a given cache entry. Other requests wait. `proxy_cache_lock_age` controls how long before nginx allows another request to try fetching.
+**What it does**: When cache lock is held, this is how long before nginx allows ANOTHER request to try fetching the same cache entry (potentially in parallel).
 
-**Current behavior (2 minutes):**
+**Current value**: 2m (2 minutes)
+**Proposed value**: 30s
+
+#### Scenario: Stuck Download with Multiple Clients
+
 ```
-Request A: GET /game/slice_247 (cache miss, starts fetching)
-           [Lock acquired for slice_247]
+CURRENT BEHAVIOR (proxy_cache_lock_age 2m):
+═══════════════════════════════════════════════════════════════════════════
 
-Request B: GET /game/slice_247 (same slice)
-           [Waiting for lock... Request A has it]
+          Client A        nginx cache           upstream
+             │                │                     │
+0s           │── GET slice ──►│                     │
+             │                │── fetch slice ─────►│
+             │                │   [LOCK ACQUIRED]   │
+             │                │◄── partial data ────│
+             │                │                     │
+10s          │                │   [STUCK - no more  │
+             │                │    data arriving]   │
+             │                │                     │
+20s  Client B│── GET slice ──►│                     │
+             │                │   "Lock held by A,  │
+             │                │    please wait..."  │
+             │                │                     │
+             │        ⏳ B waits...                  │
+             │        ⏳ B waits...                  │
+             │        ⏳ B waits...                  │
+             │                │                     │
+2m           │                │   [LOCK AGE EXPIRES]│
+             │                │                     │
+             │                │── fetch slice ─────►│  (B can now try)
+             │                │◄── success! ────────│
+             │                │                     │
+2m+5s        │◄── stale/bad ──│                     │
+      Client B◄── fresh ──────│                     │
 
-           ... Request A stalls at 50% downloaded ...
+          ⚠️ Client B waited 2 MINUTES because A's download was stuck
 
-           [After 2 MINUTES, lock expires]
 
-Request B: [Lock released, B can now fetch]
+PROPOSED BEHAVIOR (proxy_cache_lock_age 30s):
+═══════════════════════════════════════════════════════════════════════════
+
+          Client A        nginx cache           upstream
+             │                │                     │
+0s           │── GET slice ──►│                     │
+             │                │── fetch slice ─────►│
+             │                │   [LOCK ACQUIRED]   │
+             │                │◄── partial data ────│
+             │                │                     │
+10s          │                │   [STUCK - no more  │
+             │                │    data arriving]   │
+             │                │                     │
+20s  Client B│── GET slice ──►│                     │
+             │                │   "Lock held by A,  │
+             │                │    please wait..."  │
+             │                │                     │
+30s          │                │   [LOCK AGE EXPIRES]│
+             │                │                     │
+             │                │── fetch slice ─────►│  (B tries now!)
+             │                │◄── success! ────────│
+             │                │   [NEW CACHE ENTRY] │
+             │                │                     │
+35s          │◄── timeout ────│                     │
+      Client B◄── fresh ──────│                     │
+             │                │                     │
+
+          ✓ Client B only waited 10 seconds (30s lock - 20s already elapsed)
+          ✓ Fresh, valid slice now in cache
+          ✓ A's stuck download doesn't block everyone
 ```
 
-If Request A's download is corrupt/stuck, every other client waits 2 full minutes before anyone can retry.
+#### Why 30s for 1MB Slices?
 
-**With 30s lock age:**
 ```
-Request A: GET /game/slice_247 (cache miss, starts fetching)
-           [Lock acquired]
+Download time calculation for 1MB slice:
+═══════════════════════════════════════════════════════════════════════════
 
-Request B: GET /game/slice_247 (waiting...)
+Connection Speed    Time for 1MB      30s Timeout
+────────────────    ────────────      ───────────
+100 Mbps            ~0.08s            ✓ Plenty of headroom
+10 Mbps             ~0.8s             ✓ Plenty of headroom
+1 Mbps              ~8s               ✓ Good headroom
+500 Kbps            ~16s              ✓ Still OK
+250 Kbps            ~32s              ⚠️ Might trigger (very slow)
+100 Kbps            ~80s              ✗ Will trigger (extremely slow)
 
-           ... Request A stalls ...
-
-           [After 30 SECONDS, lock expires]
-
-Request B: [Can now fetch fresh copy]
-```
-
-**Why 30s for 1MB slices:**
-- A healthy 1MB download should complete in < 10s on most connections
-- 30s provides 3x headroom for slow connections
-- If a slice takes > 30s, something is likely wrong
-
-**Relationship with slice size:**
-```
-slice_size = 1MB
-expected_download_time = 1MB / bandwidth
-
-At 10 Mbps:  ~0.8 seconds
-At 1 Mbps:   ~8 seconds
-At 100 Kbps: ~80 seconds (very slow upstream)
-
-30s covers most scenarios except extremely slow connections
+For LAN cache scenario:
+- Upstream (internet) connection is typically 100+ Mbps
+- 1MB should download in well under 10 seconds normally
+- 30s provides 3-6x headroom for slow/loaded CDNs
+- If it takes >30s for 1MB, something is likely wrong
 ```
 
-**Impact on corrupt cache prevention:**
-- **HIGH** - This is one of the most important changes
-- Faster recovery when a download gets stuck
-- Other clients can retry and potentially get good copy
-- **Risk**: May cause duplicate upstream requests if legitimately slow
+**Why it helps prevent corrupt cache**:
+- **This is one of the most impactful changes**
+- Stuck downloads don't block all other clients
+- Fresh download attempts can succeed and replace bad entries
+- Self-healing: good data from client B replaces A's stuck attempt
+
+**Risk**: Medium - may cause duplicate upstream requests during slow periods (acceptable trade-off)
 
 ---
 
-### 5. `proxy_cache_lock_timeout` (propose: 3m, current: 1h)
+### 5. `proxy_cache_lock_timeout 3m` (Currently: 1h)
 
-**What it does:**
-Absolute maximum time a request will wait for cache lock before bypassing the lock entirely and fetching directly (uncached).
+**What it does**: Absolute maximum time ANY request will wait for cache lock before bypassing cache entirely.
 
-**Current behavior (1 hour!):**
+**Current value**: 1h (1 hour!)
+**Proposed value**: 3m (3 minutes)
+
+#### Scenario: Completely Broken Cache Population
+
 ```
-Request A: Starts fetching, gets stuck
-Request B: Waits for lock...
+CURRENT BEHAVIOR (proxy_cache_lock_timeout 1h):
+═══════════════════════════════════════════════════════════════════════════
 
-           [proxy_cache_lock_age expires after 2m]
+          Multiple           nginx                 upstream
+          Clients            cache                (having issues)
+             │                 │                      │
+0s        A──│── GET slice ───►│                      │
+             │                 │── fetch ────────────►│
+             │                 │   [LOCK ACQUIRED]    │
+             │                 │◄── stuck... ─────────│
+             │                 │                      │
+30s       B──│── GET slice ───►│                      │
+             │                 │   "wait for lock"    │
+             │                 │                      │
+2m           │                 │   [LOCK_AGE expires] │
+             │                 │                      │
+          B──│                 │── retry fetch ──────►│
+             │                 │◄── also stuck... ────│
+             │                 │                      │
+4m        C──│── GET slice ───►│                      │
+             │                 │   "wait for lock"    │
+             │                 │                      │
+             │                 │   [LOCK_AGE expires] │
+          C──│                 │── retry fetch ──────►│
+             │                 │◄── also stuck... ────│
+             │                 │                      │
+             │         ... cycle continues ...        │
+             │                 │                      │
+             │     ┌───────────────────────────────┐  │
+             │     │  EVERY REQUEST STUCK IN THIS  │  │
+             │     │  LOOP FOR UP TO 1 HOUR        │  │
+             │     └───────────────────────────────┘  │
+             │                 │                      │
+1 HOUR       │                 │   [LOCK_TIMEOUT!]   │
+             │                 │   "Bypass cache"     │
+             │                 │                      │
+          ALL│◄── direct fetch (uncached) ───────────│
+             │                 │                      │
 
-Request B: Tries to fetch, also gets stuck
-Request C: Waits for lock...
+          ⚠️ ALL clients for this slice blocked for 1 HOUR
+          ⚠️ Terrible user experience at LAN party
 
-           [Cycle continues for up to 1 HOUR]
 
-           Finally: Requests bypass cache entirely
+PROPOSED BEHAVIOR (proxy_cache_lock_timeout 3m):
+═══════════════════════════════════════════════════════════════════════════
+
+          Multiple           nginx                 upstream
+          Clients            cache                (having issues)
+             │                 │                      │
+0s        A──│── GET slice ───►│                      │
+             │                 │── fetch ────────────►│
+             │                 │   [LOCK ACQUIRED]    │
+             │                 │◄── stuck... ─────────│
+             │                 │                      │
+30s       B──│── GET slice ───►│                      │
+             │                 │   "wait for lock"    │
+             │                 │                      │
+1m           │                 │   [LOCK_AGE: 30s]    │
+          B──│                 │── retry fetch ──────►│
+             │                 │◄── also stuck... ────│
+             │                 │                      │
+2m        C──│── GET slice ───►│                      │
+             │                 │   [LOCK_AGE: 30s]    │
+          C──│                 │── retry fetch ──────►│
+             │                 │◄── also stuck... ────│
+             │                 │                      │
+3m           │                 │   [LOCK_TIMEOUT!]    │
+             │                 │                      │
+             │     ┌───────────────────────────────┐  │
+             │     │  "Cache is broken for this    │  │
+             │     │   entry, bypass and fetch     │  │
+             │     │   directly from upstream"     │  │
+             │     └───────────────────────────────┘  │
+             │                 │                      │
+          ALL│◄── direct fetch (bypasses cache) ─────│
+             │                 │                      │
+
+          ✓ System recovers in 3 MINUTES instead of 1 hour
+          ✓ Clients get their files (even if uncached)
+          ✓ Next successful fetch can repopulate cache
 ```
 
-This 1 hour timeout is extremely conservative. If something is broken, users wait up to an hour before the system gives up and bypasses cache.
+**Why it helps prevent corrupt cache**:
+- Prevents hour-long outages when cache population fails
+- System recovers and clients get files within minutes
+- Bypassed requests can potentially succeed and repopulate cache
 
-**With 3 minute timeout:**
-```
-Request A: Starts fetching, gets stuck
-
-           [After 3 minutes total]
-
-All waiting requests: "Cache is broken, fetching directly"
-           [Bypass cache, get file from upstream]
-```
-
-**Why 3 minutes:**
-- Even the largest slice (1MB) should download in < 3m
-- Provides enough time for `proxy_cache_lock_age` to cycle a few times
-- Prevents hour-long waits when cache population is truly broken
-
-**Impact on corrupt cache prevention:**
-- **HIGH** - Prevents prolonged serving of corrupt content
-- System recovers within minutes instead of hours
-- **Risk**: More cache bypasses under extreme load (acceptable trade-off)
+**Risk**: Low - 3 minutes is still long enough for legitimate caching, short enough for recovery
 
 ---
 
 ### 6. `proxy_next_upstream` Enhancement
 
-**Current configuration:**
-```nginx
-proxy_next_upstream error timeout http_404;
+**What it does**: Defines conditions under which nginx will retry the request with another attempt.
+
+**Current value**: `error timeout http_404`
+**Proposed value**: `error timeout http_404 http_500 http_502 http_503 http_504 invalid_header`
+
+Also adding:
+- `proxy_next_upstream_tries 3` - Retry up to 3 times
+- `proxy_next_upstream_timeout 0` - No overall timeout for retry process
+
+#### Scenario: Partial Response with Valid Headers
+
+```
+THE CRITICAL CASE - invalid_header:
+═══════════════════════════════════════════════════════════════════════════
+
+Upstream starts responding, then dies mid-transfer:
+
+          nginx                                   upstream
+            │                                        │
+            │── GET /game/slice_247 ────────────────►│
+            │                                        │
+            │◄─────────── HTTP HEADERS ──────────────│
+            │   HTTP/1.1 206 Partial Content         │
+            │   Content-Length: 1048576              │
+            │   Content-Range: bytes 0-1048575/...   │
+            │                                        │
+            │◄─────────── BODY (partial) ────────────│
+            │   [200KB of data received]             │
+            │                                        │
+            │         ════════════════════           │
+            │         ║ CONNECTION DIES ║           X
+            │         ════════════════════
+            │
+            │   Headers were valid ✓
+            │   Body is incomplete ✗
+            │
+
+
+WITHOUT invalid_header:
+═══════════════════════════════════════════════════════════════════════════
+
+            │
+            │   nginx received valid 206 headers
+            │   nginx received 200KB of body
+            │   Connection ended
+            │
+            │   ┌─────────────────────────────────┐
+            │   │  "Headers look fine, I'll cache │
+            │   │   what I got"                   │
+            │   └─────────────────────────────────┘
+            │
+            │   ⚠️ PARTIAL 200KB CACHED AS VALID!
+            │
+            │   All future clients get truncated
+            │   slice until manual intervention
+
+
+WITH invalid_header:
+═══════════════════════════════════════════════════════════════════════════
+
+            │
+            │   nginx received valid 206 headers
+            │   nginx received 200KB of body
+            │   Connection ended unexpectedly
+            │
+            │   ┌─────────────────────────────────┐
+            │   │  "Response was incomplete/      │
+            │   │   invalid - try again"          │
+            │   └─────────────────────────────────┘
+            │
+            │── RETRY (attempt 2/3) ────────────────►│ (maybe different CDN node)
+            │                                        │
+            │◄─────────── SUCCESS! ──────────────────│
+            │   [Complete 1MB slice received]        │
+            │                                        │
+            │   ✓ Valid slice cached
+            │   ✓ No manual intervention needed
 ```
 
-**Proposed configuration:**
-```nginx
+#### The Full Retry Flow
+
+```
 proxy_next_upstream error timeout http_404 http_500 http_502 http_503 http_504 invalid_header;
 proxy_next_upstream_tries 3;
 proxy_next_upstream_timeout 0;
+
+═══════════════════════════════════════════════════════════════════════════
+
+          nginx                                    upstream CDN
+            │                                         │
+            │── Attempt 1 ───────────────────────────►│
+            │◄── 502 Bad Gateway ────────────────────│
+            │                                         │
+            │   [502 in retry list → RETRY]           │
+            │                                         │
+            │── Attempt 2 ───────────────────────────►│
+            │◄── timeout (CDN overloaded) ───────────│
+            │                                         │
+            │   [timeout in retry list → RETRY]       │
+            │                                         │
+            │── Attempt 3 ───────────────────────────►│
+            │◄── 206 OK + complete body ─────────────│
+            │                                         │
+            │   ✓ Success on 3rd attempt              │
+            │   ✓ Valid slice cached                  │
+            │   ✓ Client served successfully          │
+
+
+Retry triggers:
+┌──────────────────┬────────────────────────────────────────────────┐
+│ Condition        │ What it catches                                │
+├──────────────────┼────────────────────────────────────────────────┤
+│ error            │ Connection errors, socket failures             │
+│ timeout          │ proxy_connect/read/send_timeout exceeded       │
+│ http_404         │ Upstream says file not found (might be temp)   │
+│ http_500         │ Upstream internal error                        │
+│ http_502         │ Upstream's upstream failed                     │
+│ http_503         │ Upstream service unavailable                   │
+│ http_504         │ Upstream gateway timeout                       │
+│ invalid_header   │ Empty/malformed/incomplete response  ← KEY!    │
+└──────────────────┴────────────────────────────────────────────────┘
 ```
 
-**What each parameter does:**
+**Why it helps prevent corrupt cache**:
+- `invalid_header` catches many partial/incomplete responses
+- Automatic retry gives transient failures a chance to succeed
+- Multiple attempts increase chance of getting valid data
 
-**`proxy_next_upstream` conditions:**
-| Condition | Meaning |
-|-----------|---------|
-| `error` | Connection error occurred |
-| `timeout` | Timeout during connection/read/write |
-| `http_404` | Upstream returned 404 (current) |
-| `http_500` | Upstream returned 500 Internal Server Error |
-| `http_502` | Upstream returned 502 Bad Gateway |
-| `http_503` | Upstream returned 503 Service Unavailable |
-| `http_504` | Upstream returned 504 Gateway Timeout |
-| `invalid_header` | **KEY** - Upstream returned invalid/empty response |
-
-**`invalid_header` is critical:**
-```
-Scenario: Upstream starts sending response, then dies
-
-nginx receives:
-  HTTP/1.1 200 OK
-  Content-Length: 1048576
-  [connection drops - no body]
-
-Without invalid_header: nginx may cache this partial response
-With invalid_header: nginx detects invalid response, retries
-```
-
-**`proxy_next_upstream_tries 3`:**
-Retry up to 3 times before giving up. This means:
-```
-Attempt 1: upstream-a.cdn.com → fails
-Attempt 2: upstream-b.cdn.com → fails
-Attempt 3: upstream-c.cdn.com → success!
-```
-
-For lancache with single upstream, this means:
-```
-Attempt 1: origin server → timeout
-Attempt 2: origin server → success (transient issue resolved)
-```
-
-**`proxy_next_upstream_timeout 0`:**
-No overall timeout for retry cycle. Each individual attempt has its own timeout, but the retry process itself isn't time-limited.
-
-**Impact on corrupt cache prevention:**
-- **HIGH** - `invalid_header` catches partial/corrupt responses before caching
-- Automatic retry logic recovers from transient failures
-- **Risk**: More upstream requests during failure scenarios (desired behavior)
+**Risk**: Low - more upstream requests during failure scenarios (desired behavior)
 
 ---
 
 ### 7. `proxy_cache_background_update on`
 
-**What it does:**
-When serving stale cached content, nginx fetches a fresh copy in the background.
+**What it does**: When serving stale/expired cache content, nginx fetches fresh copy in background.
 
-**Current behavior (without it):**
+**Current value**: Not set (disabled)
+**Proposed value**: `on`
+
+#### Scenario: Self-Healing Corrupt Cache Entry
+
 ```
-Client A: GET /game/file.zip (cache HIT, but entry is stale)
-          [Serves stale content immediately]
-          [Does NOT refresh cache]
+WITHOUT proxy_cache_background_update:
+═══════════════════════════════════════════════════════════════════════════
 
-Client B: GET /game/file.zip (same stale entry)
-          [Serves same stale content]
-          [Still no refresh unless cache lock triggers]
+State: Slice 247 is corrupt in cache (partial data from previous failure)
+
+          Client A           nginx cache            upstream
+             │                    │                     │
+             │                    │  ┌──────────────┐   │
+             │                    │  │ slice_247:   │   │
+             │                    │  │ CORRUPT/STALE│   │
+             │                    │  │ (200KB only) │   │
+             │                    │  └──────────────┘   │
+             │                    │                     │
+             │── GET slice_247 ──►│                     │
+             │                    │                     │
+             │                    │  "Cache HIT (stale)"│
+             │                    │                     │
+             │◄── 200KB corrupt ──│                     │
+             │                    │                     │
+             │   ⚠️ Client gets    │  (no refresh       │
+             │     corrupt data   │   triggered)       │
+             │                    │                     │
+          Client B               │                     │
+             │── GET slice_247 ──►│                     │
+             │◄── 200KB corrupt ──│                     │
+             │                    │                     │
+          Client C               │                     │
+             │── GET slice_247 ──►│                     │
+             │◄── 200KB corrupt ──│                     │
+             │                    │                     │
+             │   ... forever until manual cleanup ...   │
+
+
+WITH proxy_cache_background_update on:
+═══════════════════════════════════════════════════════════════════════════
+
+State: Slice 247 is corrupt in cache (partial data from previous failure)
+
+          Client A           nginx cache            upstream
+             │                    │                     │
+             │                    │  ┌──────────────┐   │
+             │                    │  │ slice_247:   │   │
+             │                    │  │ CORRUPT/STALE│   │
+             │                    │  │ (200KB only) │   │
+             │                    │  └──────────────┘   │
+             │                    │                     │
+             │── GET slice_247 ──►│                     │
+             │                    │                     │
+             │                    │  "Cache HIT (stale)"│
+             │                    │  "Starting background│
+             │                    │   update..."        │
+             │                    │                     │
+             │◄── 200KB corrupt ──│── bg fetch ────────►│
+             │                    │                     │
+             │   ⚠️ Client A gets │◄── 1MB valid ───────│
+             │     corrupt data   │                     │
+             │     (unavoidable)  │  ┌──────────────┐   │
+             │                    │  │ slice_247:   │   │
+             │                    │  │ VALID/FRESH  │   │
+             │                    │  │ (1MB complete)│   │
+             │                    │  └──────────────┘   │
+             │                    │                     │
+          Client B               │                     │
+             │── GET slice_247 ──►│                     │
+             │                    │  "Cache HIT (fresh)"│
+             │◄── 1MB valid!! ────│                     │
+             │                    │                     │
+          Client C               │                     │
+             │── GET slice_247 ──►│                     │
+             │◄── 1MB valid!! ────│                     │
+             │                    │                     │
+             │   ✓ Cache self-healed!                   │
+             │   ✓ Only Client A got corrupt data       │
+             │   ✓ No manual intervention needed        │
 ```
 
-**With background update:**
-```
-Client A: GET /game/file.zip (cache HIT, stale)
-          [Serves stale content immediately]
-          [ALSO starts background fetch for fresh copy]
+**Why it helps prevent corrupt cache**:
+- **Self-healing mechanism** - corrupt entries get replaced automatically
+- First client after corruption triggers refresh
+- Subsequent clients get valid data
+- No manual cleanup required for these cases
 
-          ... background update completes ...
-
-Client B: GET /game/file.zip
-          [Serves fresh cached content]
-```
-
-**How this helps with corrupt cache:**
-If a cache entry becomes corrupt (partial data), and `proxy_cache_use_stale` serves it:
-- Without background update: Corrupt entry continues being served indefinitely
-- With background update: Fresh copy fetched in background, replaces corrupt entry
-
-**Self-healing behavior:**
-```
-Corrupt slice in cache
-         │
-         ▼
-Client requests slice
-         │
-         ▼
-Stale/corrupt content served (unfortunately)
-         │
-         ▼
-Background update triggered
-         │
-         ▼
-Fresh, valid slice fetched from upstream
-         │
-         ▼
-Corrupt cache entry REPLACED with valid one
-         │
-         ▼
-Next client gets valid content
-```
-
-**Impact on corrupt cache prevention:**
-- **MEDIUM-HIGH** - Doesn't prevent initial corruption, but auto-heals
-- Corrupt entries get replaced without manual intervention
-- **Risk**: Increased upstream bandwidth (acceptable for cache health)
+**Risk**: Low - slight increase in upstream bandwidth (acceptable for cache health)
 
 ---
 
-### 8. `proxy_cache_use_stale` Adjustment (Optional - More Aggressive)
+## Summary: Configuration Changes
 
-**Current configuration:**
+### File: `overlay/etc/nginx/sites-available/cache.conf.d/root/20_cache.conf`
+
 ```nginx
+# EXISTING (keep these):
+slice 1m;
+proxy_cache generic;
+proxy_ignore_headers Expires Cache-Control;
+proxy_cache_valid 200 206 CACHE_MAX_AGE;
+proxy_set_header Range $slice_range;
+proxy_cache_lock on;
 proxy_cache_use_stale error timeout invalid_header updating http_500 http_502 http_503 http_504;
+proxy_cache_valid 301 302 0;
+proxy_cache_revalidate on;
+proxy_cache_bypass $arg_nocache;
+proxy_max_temp_file_size 40960m;
+
+# MODIFIED:
+proxy_cache_lock_age 30s;      # Was: 2m  - Faster recovery from stuck downloads
+proxy_cache_lock_timeout 3m;   # Was: 1h  - Don't wait forever
+
+# NEW:
+proxy_cache_background_update on;  # Self-healing for stale/corrupt entries
 ```
 
-**Conservative option:**
+### File: `overlay/etc/nginx/sites-available/cache.conf.d/root/90_upstream.conf`
+
 ```nginx
-proxy_cache_use_stale updating http_500 http_502 http_503 http_504;
-```
+# EXISTING (keep these):
+proxy_next_upstream error timeout http_404;  # Will be modified below
+proxy_pass http://127.0.0.1:3128$request_uri;
+proxy_redirect off;
+proxy_ignore_client_abort on;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 
-**What changes:**
-
-| Condition | Current | Conservative | Effect |
-|-----------|---------|--------------|--------|
-| `error` | Serve stale | Retry upstream | May fail if upstream down |
-| `timeout` | Serve stale | Retry upstream | May fail if upstream slow |
-| `invalid_header` | Serve stale | Retry upstream | Forces fresh fetch |
-| `updating` | Serve stale | Serve stale | No change |
-| `http_5xx` | Serve stale | Serve stale | No change |
-
-**Trade-off:**
-```
-Permissive (current):
-  Upstream error → Serve cached (possibly corrupt) content
-  User experience: Fast, but possibly broken content
-
-Conservative:
-  Upstream error → Try to fetch fresh content
-  User experience: Slower, but more likely to get valid content
-```
-
-**Recommendation:**
-Keep current settings but add `proxy_cache_background_update on`. This gives:
-- Fast response (serve stale)
-- Self-healing (background refresh)
-- Best of both worlds
-
-**Impact on corrupt cache prevention:**
-- **MEDIUM** - Removing `error`/`timeout` from stale conditions forces refetch
-- Trade-off between availability and correctness
-- **Risk**: Higher - may cause failures during upstream outages
-
----
-
-## Implementation Summary
-
-### Files to Modify
-
-**1. `/overlay/etc/nginx/sites-available/cache.conf.d/root/20_cache.conf`**
-
-Add/modify:
-```nginx
-# Faster lock recovery (currently 2m, propose 30s)
-proxy_cache_lock_age 30s;
-
-# Faster total timeout (currently 1h, propose 3m)
-proxy_cache_lock_timeout 3m;
-
-# Enable self-healing background updates
-proxy_cache_background_update on;
-```
-
-**2. `/overlay/etc/nginx/sites-available/cache.conf.d/root/90_upstream.conf`**
-
-Add/modify:
-```nginx
-# Detect dead connections faster
-proxy_socket_keepalive on;
-
-# Explicit timeouts
-proxy_connect_timeout 10s;
-proxy_read_timeout 150s;
-proxy_send_timeout 60s;
-
-# Enhanced retry logic with invalid_header detection
+# MODIFIED:
 proxy_next_upstream error timeout http_404 http_500 http_502 http_503 http_504 invalid_header;
-proxy_next_upstream_tries 3;
-proxy_next_upstream_timeout 0;
+
+# NEW:
+proxy_socket_keepalive on;        # Faster dead connection detection
+proxy_connect_timeout 10s;        # Fail fast if upstream unreachable
+proxy_read_timeout 150s;          # Kill stuck downloads
+proxy_send_timeout 60s;           # Kill stuck uploads
+proxy_next_upstream_tries 3;      # Retry up to 3 times
+proxy_next_upstream_timeout 0;    # No overall retry timeout
 ```
 
 ---
 
-## Expected Outcomes
+## What This Does NOT Solve
 
-### Before (Current State)
+These nginx configuration changes **minimize** but **cannot fully prevent** corrupt cache entries:
+
+### Limitations
+
 ```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    WHAT NGINX CANNOT DETECT                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. Content-Length vs Actual Bytes Mismatch                            │
+│     ─────────────────────────────────────────                          │
+│     nginx does NOT verify that received bytes match Content-Length     │
+│     A response with Content-Length: 1048576 but only 500KB body        │
+│     may still be cached as "valid"                                     │
+│                                                                         │
+│  2. Disk Write Corruption                                              │
+│     ────────────────────────                                           │
+│     nginx does NOT checksum data written to disk                       │
+│     Bit rot, disk errors, or filesystem corruption is not detected     │
+│                                                                         │
+│  3. Memory Corruption                                                   │
+│     ─────────────────────                                              │
+│     nginx does NOT validate data integrity in memory buffers           │
+│     RAM errors could corrupt data before it reaches disk               │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Recommended Additional Layers (Not Implemented Here)
+
+**Layer 2: Filesystem-Level Integrity**
+- Use ZFS or Btrfs for cache volume
+- These filesystems checksum every block
+- Detects and can auto-heal disk corruption
+- Run regular `scrub` operations
+
+**Layer 3: Monitoring**
+- Monitor `$upstream_cache_status` in logs
+- Alert on unusual MISS/STALE ratios
+- Track upstream response codes
+
+---
+
+## Expected Improvement
+
+```
+BEFORE (Current Configuration):
+═══════════════════════════════════════════════════════════════════════════
+
 Corrupt slice scenario:
 1. Upstream drops mid-transfer
-2. Partial slice cached with valid headers
-3. nginx serves corrupt slice to all clients
-4. Cache lock blocks retries for 2 minutes
-5. If still broken, waits up to 1 hour
+2. Partial slice may be cached (nginx doesn't validate body completeness)
+3. Cache lock blocks other requests for 2 MINUTES
+4. If problem persists, blocks for up to 1 HOUR
+5. Corrupt entry served indefinitely
 6. Manual intervention required (find + awk + rm)
-```
 
-### After (With Changes)
-```
-Same scenario with new config:
+Recovery time: HOURS to NEVER (without manual intervention)
+
+
+AFTER (Proposed Configuration):
+═══════════════════════════════════════════════════════════════════════════
+
+Same scenario:
 1. Upstream drops mid-transfer
 2. proxy_socket_keepalive detects dead connection faster
-3. invalid_header triggers retry (up to 3 attempts)
-4. If retry fails, lock released after 30s for next request
-5. If still broken, cache bypassed after 3 minutes
+3. invalid_header in proxy_next_upstream triggers retry (up to 3 attempts)
+4. If retry fails:
+   - Cache lock released after 30 SECONDS (not 2 minutes)
+   - Next client request can try fresh
+5. If still broken:
+   - Cache bypassed after 3 MINUTES (not 1 hour)
+   - Clients get direct upstream response
 6. proxy_cache_background_update refreshes stale entries automatically
-7. Self-healing - no manual intervention needed
+7. Self-healing - many cases resolve without manual intervention
+
+Recovery time: SECONDS to MINUTES (automatic in many cases)
 ```
-
-### Metrics to Monitor
-
-After implementing, monitor these nginx variables in logs:
-- `$upstream_cache_status` - Track HIT/MISS/STALE/BYPASS ratios
-- `$upstream_status` - Monitor upstream response codes
-- `$upstream_response_time` - Detect slow upstreams
-
----
-
-## Risk Assessment
-
-| Change | Risk Level | Mitigation |
-|--------|------------|------------|
-| `proxy_socket_keepalive on` | None | Pure benefit |
-| `proxy_connect_timeout 10s` | Very Low | 10s is generous |
-| `proxy_read_timeout 150s` | Low | Can increase if needed |
-| `proxy_cache_lock_age 30s` | Medium | May cause more upstream requests |
-| `proxy_cache_lock_timeout 3m` | Low | Still provides good caching |
-| `proxy_next_upstream ... invalid_header` | Low | Desired retry behavior |
-| `proxy_cache_background_update on` | Low | Slight bandwidth increase |
-
-**Overall Risk: LOW** - These are conservative changes that improve reliability without fundamentally changing caching behavior.
-
----
-
-## Questions Before Implementation
-
-1. Should `proxy_cache_use_stale` be made more conservative (remove `error timeout invalid_header`)?
-   - Pro: Forces fresh fetch on errors
-   - Con: May cause failures during upstream outages
-
-2. Are the timeout values appropriate for your network/CDN conditions?
-   - `proxy_read_timeout 150s` - sufficient for slow CDNs?
-   - `proxy_cache_lock_age 30s` - appropriate for 1MB slices?
-
-3. Should these be configurable via environment variables (like other settings)?
