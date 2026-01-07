@@ -511,17 +511,17 @@ done
 | File | Changes |
 |------|---------|
 | `overlay/etc/nginx/conf.d/10_log_format.conf` | Added upstream error variables to existing formats |
-
-### Files to Create (Future)
-
-| File | Purpose |
-|------|---------|
 | `overlay/scripts/cache-health-monitor.sh` | Real-time console monitoring |
 | `overlay/scripts/find-suspect-cache.sh` | Log analysis to find problematic URIs |
 | `overlay/scripts/find-cache-file.sh` | Locate and delete cache files by URI |
 | `overlay/scripts/cache-health-daemon.sh` | Automated background remediation |
-| `overlay/scripts/cache-metrics.sh` | Prometheus-format metrics |
-| `overlay/etc/supervisor/conf.d/cache-health.conf` | Supervisor config for daemon |
+| `overlay/etc/supervisor/conf.d/cache-health.conf` | Supervisor config for daemon (autostart=false) |
+
+### Not Implemented (Future Enhancement)
+
+| File | Purpose |
+|------|---------|
+| `overlay/scripts/cache-metrics.sh` | Prometheus-format metrics (separate PR) |
 
 ---
 
