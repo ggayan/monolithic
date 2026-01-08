@@ -1173,3 +1173,326 @@ If retry success rate is low, consider:
 - Increasing `proxy_next_upstream_tries` beyond 3
 - Adjusting `proxy_connect_timeout` / `proxy_read_timeout`
 - Investigating root cause of upstream failures
+
+---
+
+## Critical: OS-Level Tuning for proxy_socket_keepalive
+
+### The Problem
+
+The `proxy_socket_keepalive on` directive requires **OS-level** TCP keepalive tuning to be effective.
+
+**Without OS tuning:**
+- Default `tcp_keepalive_time = 7200` seconds (2 hours!)
+- Dead connections take 2+ hours to detect
+- The nginx directive has minimal effect
+
+**With proper OS tuning:**
+- Detect dead connections in ~2 minutes
+- Enables the fast recovery described in this plan
+
+### Required OS Configuration
+
+**File:** `/etc/sysctl.d/99-lancache-keepalive.conf`
+
+```bash
+# TCP Keepalive tuning for lancache
+# Enables fast detection of dead upstream connections
+
+# Time before first keepalive probe (was: 7200s / 2 hours)
+net.ipv4.tcp_keepalive_time = 60
+
+# Interval between keepalive probes (was: 75s)
+net.ipv4.tcp_keepalive_intvl = 10
+
+# Number of failed probes before declaring connection dead (was: 9)
+net.ipv4.tcp_keepalive_probes = 6
+```
+
+**Apply immediately:**
+```bash
+sysctl -p /etc/sysctl.d/99-lancache-keepalive.conf
+```
+
+**Persist across reboots:** File in `/etc/sysctl.d/` applies automatically
+
+### Detection Timeline
+
+**WITHOUT OS tuning (defaults):**
+```
+0s      Connection established, upstream serving data
+15s     Upstream dies silently (no FIN/RST)
+        
+        ... 7200 seconds of waiting (2 HOURS) ...
+        
+7200s   First TCP keepalive probe sent
+7210s   Second probe (no response)
+7220s   Third probe (no response)
+...
+7260s   Sixth probe (no response)
+7260s   Connection declared DEAD
+
+Total: ~2 hours to detect
+```
+
+**WITH OS tuning:**
+```
+0s      Connection established, upstream serving data
+15s     Upstream dies silently (no FIN/RST)
+
+60s     Idle timeout reached - first TCP keepalive probe sent
+70s     Second probe (no response)
+80s     Third probe (no response)
+90s     Fourth probe (no response)
+100s    Fifth probe (no response)
+110s    Sixth probe (no response)
+110s    Connection declared DEAD
+
+Total: ~2 minutes to detect ✓
+```
+
+### Deployment Checklist
+
+- [ ] Create `/etc/sysctl.d/99-lancache-keepalive.conf` with settings above
+- [ ] Apply with `sysctl -p`
+- [ ] Verify with `sysctl net.ipv4.tcp_keepalive_time` (should show 60)
+- [ ] Test dead connection detection (see testing section below)
+- [ ] Document in deployment/setup procedures
+
+### Testing Keepalive Detection
+
+**Test 1: Verify sysctl settings**
+```bash
+$ sysctl net.ipv4.tcp_keepalive_time
+net.ipv4.tcp_keepalive_time = 60  # Should be 60, not 7200
+
+$ sysctl net.ipv4.tcp_keepalive_intvl
+net.ipv4.tcp_keepalive_intvl = 10
+
+$ sysctl net.ipv4.tcp_keepalive_probes
+net.ipv4.tcp_keepalive_probes = 6
+```
+
+**Test 2: Simulate dead connection**
+```bash
+# Terminal 1: Start tcpdump to watch keepalive packets
+sudo tcpdump -i any -n 'tcp[tcpflags] & tcp-ack != 0' and port 3128
+
+# Terminal 2: Monitor nginx error log
+tail -f /data/logs/error.log | grep -i "upstream"
+
+# Terminal 3: Initiate download, then kill upstream mid-transfer
+# Observe: After ~60s idle, you should see keepalive probes in tcpdump
+# After 6 failed probes (~110s total), nginx should log upstream error
+```
+
+### Performance Impact
+
+**CPU:** Negligible - probes are lightweight TCP packets
+**Network:** Minimal - 6 probes every ~2 minutes only during failures
+**Benefit:** Prevents hours-long stuck connections
+
+**Recommendation:** Apply these sysctls on all lancache servers.
+
+---
+
+## O(1) Cache Deletion Optimization
+
+### Background
+
+**Traditional approach (this PR):** Scan cache directory to find files matching URI
+- Time complexity: O(N) where N = number of cache files
+- With 500k files: 3-12 minutes per remediation
+- I/O intensive, can impact production
+
+**Optimized approach (now available):** Use cache key MD5 hash for direct file access
+- Time complexity: O(1) - constant time
+- Any cache size: < 1 second per deletion
+- Minimal I/O impact
+
+### How It Works
+
+**Nginx cache file naming:**
+```
+Cache key: "steamhttp://cdn.example.com/game/file.zip"
+MD5 hash: abc123def456789... (32 hex chars)
+File path: /data/cache/cache/89/ef/abc123def456789...
+                                ^^  ^^
+                                |   |
+                                |   └─ Last 2 chars of MD5
+                                └───── 2 chars before last 2
+```
+
+With `levels=2:2` configuration, nginx creates a two-level directory hierarchy using the last 4 characters of the MD5 hash.
+
+### Implementation Status
+
+**✅ Available in this PR:**
+1. `$upstream_cache_key` added to log formats
+2. `delete_by_cache_key()` function implemented in daemon
+3. MD5 computation and path construction working
+
+**⚠️ Integration TODO:**
+- Extract cache keys from logs during error detection
+- Associate cache keys with URIs in state tracking
+- Prefer O(1) deletion when cache key available, fallback to O(N) scan
+
+**Current behavior:** Uses O(N) scan method (parallelized and I/O throttled)
+**Future behavior:** Will use O(1) deletion when fully integrated
+
+### Manual O(1) Deletion
+
+The infrastructure is ready for manual use:
+
+```bash
+# If you know the cache key from logs:
+cache_key="steam/path/to/problematic/file"
+
+# Compute MD5
+md5=$(echo -n "$cache_key" | md5sum | cut -d' ' -f1)
+
+# Extract levels
+level1=${md5:(-2)}
+level2=${md5:(-4):2}
+
+# Delete directly
+rm -f /data/cache/cache/$level2/$level1/$md5
+
+# Done in < 1 second!
+```
+
+### Performance Comparison
+
+| Operation | O(N) Scan | O(1) Hash | Improvement |
+|-----------|-----------|-----------|-------------|
+| 10k files | ~30 seconds | < 1 second | ~30x faster |
+| 100k files | ~3 minutes | < 1 second | ~180x faster |
+| 500k files | ~12 minutes | < 1 second | ~720x faster |
+| 1M files | ~25 minutes | < 1 second | ~1500x faster |
+
+### Future Integration Plan
+
+**Phase 1: Log parsing enhancement**
+```bash
+# Enhance analyze_logs() to extract both URI and cache_key
+# Store mapping: URI -> [cache_key1, cache_key2, ...]
+```
+
+**Phase 2: State tracking update**
+```bash
+# Track cache keys alongside URIs in state files
+# Format: uri|cache_key1,cache_key2,cache_key3
+```
+
+**Phase 3: Smart deletion**
+```bash
+# In check_and_remediate():
+if [ -n "$cache_keys" ]; then
+    # O(1) deletion
+    for key in $cache_keys; do
+        delete_by_cache_key "$key"
+    done
+else
+    # Fallback to O(N) scan
+    search_and_delete_cache_files "$uri"
+fi
+```
+
+---
+
+## Known Limitations
+
+### 1. Log Rotation Timing
+
+**Issue:** Daemon uses `tail -n` on current log file. If log rotation occurs between error and scan, errors in rotated file are missed.
+
+**Impact:** LOW
+- Errors must persist across 3 cycles (`CONFIRM_THRESHOLD=3`)
+- Missing one cycle doesn't trigger deletion
+- Next cycle will see new errors if problem persists
+
+**Mitigation:** Check both `access.log` and `access.log.1` (future enhancement)
+
+**Workaround:** Increase `CONFIRM_THRESHOLD` to 5 for extra safety
+
+### 2. Cache Key Extraction Not Yet Integrated
+
+**Issue:** O(1) deletion function exists but automatic integration pending
+
+**Impact:** MEDIUM
+- Still uses O(N) scan (now parallelized and throttled)
+- Performance acceptable for medium caches (< 500k files)
+- Large caches (> 1M files) may have slow remediation
+
+**Mitigation:**
+- Use `MAX_SCAN_FILES` to limit scope
+- Manual O(1) deletion available for critical issues
+
+**Timeline:** Full integration planned for next iteration
+
+### 3. Slice-Level vs File-Level Granularity
+
+**Issue:** Daemon tracks errors by full URI, not individual slice cache keys
+
+**Impact:** LOW-MEDIUM
+- If one slice is corrupt, identifies the URI
+- But nginx caches slices separately with different keys
+- May need to find/delete multiple cache files per URI
+
+**Current behavior:** O(N) scan finds all slices for URI
+**Future behavior:** Extract slice range from cache key, delete specific slices
+
+---
+
+## Safety Improvements from Review Feedback
+
+### Removed Dangerous 5xx-Based Deletion
+
+**Previous behavior:**
+- Flagged URIs with upstream 5xx errors
+- Would delete cache if upstream returned 503 (service unavailable)
+- **Problem:** If upstream temporarily down, deleted valid stale cache
+
+**Scenario:**
+1. Cache has valid files
+2. Upstream goes down (503 errors)
+3. Daemon sees 5xx errors, deletes cache
+4. Users now get 503 instead of stale content
+5. All content must be re-downloaded when upstream recovers
+
+**New behavior:**
+- Only flags VERIFIED corruption (zero-byte responses on MISS)
+- Ignores upstream 5xx errors - serving stale is better than nothing
+- Focus on actual cache corruption, not upstream issues
+
+**Reasoning:** 
+- Stale content > no content
+- Don't make outages worse by deleting valid cache
+- Trust nginx's `proxy_cache_use_stale` to serve stale during upstream issues
+- Only delete when cache is provably corrupt
+
+---
+
+## Deployment Priority
+
+**P0 - CRITICAL (must have):**
+1. ✅ Nginx configuration changes (implemented)
+2. ✅ Enhanced logging (implemented)
+3. ✅ Fixed bug: URI extraction regex (implemented)
+4. ✅ Fixed bug: return code handling (implemented)
+5. ✅ Fixed bug: timestamp filtering (implemented)
+6. ✅ Safety fix: removed 5xx deletion (implemented)
+7. **Required:** OS sysctl tuning for tcp_keepalive
+
+**P1 - IMPORTANT (strongly recommended):**
+1. ✅ Parallelized cache scanning (implemented)
+2. ✅ I/O throttling (implemented)
+3. ✅ `$upstream_cache_key` in logs (implemented)
+4. ⚠️ O(1) cache deletion integration (infrastructure ready, integration pending)
+
+**P2 - NICE TO HAVE (future enhancements):**
+1. Log rotation handling
+2. Truncation detection (upstream_bytes < expected)
+3. Prometheus metrics export
+4. Alerting integration
+

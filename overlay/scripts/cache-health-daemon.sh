@@ -55,10 +55,14 @@ analyze_logs() {
     local cutoff=$((now - CHECK_INTERVAL))
 
     # Parse log and find URIs with errors
-    # Looking for:
-    # 1. Upstream 5xx errors with MISS (might have cached bad response)
-    # 2. Zero-byte responses
-    # 3. STALE responses (background update might be failing)
+    # Looking for VERIFIED corruption indicators:
+    # 1. Zero-byte responses on MISS (definitely corrupt)
+    # 2. TODO: Truncated responses (upstream_response_length << expected)
+    #
+    # NOTE: We do NOT delete on upstream 5xx errors alone!
+    # Reasoning: If upstream is down (503), deleting local valid stale cache
+    # removes the only source of content. Serving stale is better than nothing.
+    # Only delete cache entries with verified corruption.
     #
     # Note: We scan recent log entries using tail to limit scope.
     # For more precise time filtering, use JSON log format with $msec field.
@@ -85,17 +89,18 @@ analyze_logs() {
         # Check for error conditions
         is_error = 0
 
-        # Upstream 5xx error
-        if($0 ~ /"50[0-9]"[[:space:]]*[0-9]/) {
-            is_error = 1
-            error_type[uri] = "upstream_5xx"
-        }
-
-        # Zero-byte response on MISS
+        # Zero-byte response on MISS (verified corruption)
+        # This indicates cache population failed and cached empty/partial data
         if($0 ~ /"MISS"/ && $0 ~ / 0 "/) {
             is_error = 1
             error_type[uri] = "zero_bytes"
         }
+
+        # Future: Add truncation detection
+        # if(upstream_response_length > 0 && upstream_response_length < expected * 0.5) {
+        #     is_error = 1
+        #     error_type[uri] = "truncated"
+        # }
 
         if(is_error) {
             errors[uri]++
@@ -111,7 +116,38 @@ analyze_logs() {
     ' 2>/dev/null
 }
 
+# Delete cache file using cache key (O(1) - instant!)
+# Uses MD5 hash of cache key to compute direct file path
+# Cache configured with levels=2:2 in proxy_cache_path
+delete_by_cache_key() {
+    local cache_key="$1"
+
+    # Compute MD5 hash of cache key
+    local md5=$(echo -n "$cache_key" | md5sum | cut -d' ' -f1)
+
+    # Extract directory levels (levels=2:2)
+    local level1=${md5:(-2)}          # Last 2 characters
+    local level2=${md5:(-4):2}        # 2 characters before last 2
+
+    # Construct cache file path
+    local cache_file="$CACHE_DIR/$level2/$level1/$md5"
+
+    # Delete if exists
+    if [ -f "$cache_file" ]; then
+        if rm -f "$cache_file" 2>/dev/null; then
+            log "  REMOVED (O(1)): $cache_file"
+            return 0
+        else
+            log_error "  Failed to remove: $cache_file"
+            return 1
+        fi
+    fi
+
+    return 2  # File not found (may have been already deleted or expired)
+}
+
 # Optimized cache file search using parallel processing
+# NOTE: This is the fallback O(N) method when cache_key is not available
 search_and_delete_cache_files() {
     local uri="$1"
     local start_time=$(date +%s)
@@ -121,6 +157,7 @@ search_and_delete_cache_files() {
     local scanned=0
 
     log "Searching cache (max $MAX_SCAN_FILES files with $PARALLEL_JOBS workers)..."
+    log "NOTE: Using O(N) scan method - consider enabling cache_key logging for O(1) deletion"
 
     # Worker function for parallel search
     local worker_code='
