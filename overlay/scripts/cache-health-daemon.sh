@@ -86,6 +86,16 @@ analyze_logs() {
             next
         }
 
+        # Extract cache key from end of log line (after upstream_response_time)
+        # Log format: ... $upstream_response_time "$upstream_cache_key"
+        # Cache key may be empty/"-" if not a cacheable request
+        cache_key = ""
+        if(match($0, /"([^"]*)"[[:space:]]*$/, key_arr)) {
+            cache_key = key_arr[1]
+            # Ignore "-" (no cache key)
+            if(cache_key == "-") cache_key = ""
+        }
+
         # Check for error conditions
         is_error = 0
 
@@ -104,12 +114,24 @@ analyze_logs() {
 
         if(is_error) {
             errors[uri]++
+            # Collect cache keys for this URI (may have multiple slices)
+            if(cache_key != "") {
+                if(cache_keys[uri] == "") {
+                    cache_keys[uri] = cache_key
+                } else {
+                    # Check if this cache key already recorded (avoid duplicates)
+                    if(index(cache_keys[uri], cache_key) == 0) {
+                        cache_keys[uri] = cache_keys[uri] "," cache_key
+                    }
+                }
+            }
         }
     }
     END {
         for(uri in errors) {
             if(errors[uri] >= threshold) {
-                print uri "\t" errors[uri] "\t" error_type[uri]
+                # Output: uri \t error_count \t error_type \t cache_keys
+                print uri "\t" errors[uri] "\t" error_type[uri] "\t" cache_keys[uri]
             }
         }
     }
@@ -204,45 +226,100 @@ check_and_remediate() {
     local uri="$1"
     local error_count="$2"
     local error_type="$3"
+    local cache_keys="$4"  # Comma-separated list of cache keys (may be empty)
 
     local state_file=$(uri_to_statefile "$uri")
 
-    # Read or initialize confirmation count
+    # Read or initialize confirmation count and cache keys
     local confirm_count=0
+    local stored_keys=""
     if [ -f "$state_file" ]; then
-        confirm_count=$(cat "$state_file" 2>/dev/null || echo "0")
+        # State file format: count|cache_key1,cache_key2,...
+        local state_data=$(cat "$state_file" 2>/dev/null || echo "0|")
+        confirm_count=$(echo "$state_data" | cut -d'|' -f1)
+        stored_keys=$(echo "$state_data" | cut -d'|' -f2)
     fi
     ((confirm_count++))
 
+    # Merge new cache keys with stored keys (avoid duplicates)
+    if [ -n "$cache_keys" ]; then
+        if [ -z "$stored_keys" ]; then
+            stored_keys="$cache_keys"
+        else
+            # Combine and deduplicate
+            stored_keys="$stored_keys,$cache_keys"
+        fi
+    fi
+
     # Save state
-    echo "$confirm_count" > "$state_file"
+    echo "$confirm_count|$stored_keys" > "$state_file"
 
     log "SUSPECT: $uri (errors: $error_count, type: $error_type, confirmations: $confirm_count/$CONFIRM_THRESHOLD)"
+    if [ -n "$stored_keys" ]; then
+        local key_count=$(echo "$stored_keys" | tr ',' '\n' | wc -l)
+        log "  Collected $key_count cache key(s) for O(1) deletion"
+    fi
 
     # Check if we've reached confirmation threshold
     if [ "$confirm_count" -ge "$CONFIRM_THRESHOLD" ]; then
         log "CONFIRMED BAD: $uri - initiating remediation"
 
         if [ "$DRY_RUN" == "true" ]; then
-            log "DRY RUN: Would search and delete cache files for: $uri"
+            if [ -n "$stored_keys" ]; then
+                local key_count=$(echo "$stored_keys" | tr ',' '\n' | wc -l)
+                log "DRY RUN: Would delete $key_count cache files using O(1) method (instant)"
+            else
+                log "DRY RUN: Would search and delete cache files for: $uri using O(N) scan"
 
-            # Quick estimate using parallel search
-            local start_time=$(date +%s)
-            local count=$(find "$CACHE_DIR" -type f 2>/dev/null | head -n "$MAX_SCAN_FILES" | \
-                xargs -P "$PARALLEL_JOBS" -n 100 sh -c '
-                    for f in "$@"; do
-                        head -c 2000 "$f" 2>/dev/null | head -3 | grep -qF "$1" && echo 1
-                    done
-                ' _ "$uri" 2>/dev/null | wc -l)
-            local end_time=$(date +%s)
-            local elapsed=$((end_time - start_time))
+                # Quick estimate using parallel search
+                local start_time=$(date +%s)
+                local count=$(find "$CACHE_DIR" -type f 2>/dev/null | head -n "$MAX_SCAN_FILES" | \
+                    xargs -P "$PARALLEL_JOBS" -n 100 sh -c '
+                        for f in "$@"; do
+                            head -c 2000 "$f" 2>/dev/null | head -3 | grep -qF "$1" && echo 1
+                        done
+                    ' _ "$uri" 2>/dev/null | wc -l)
+                local end_time=$(date +%s)
+                local elapsed=$((end_time - start_time))
 
-            log "DRY RUN: Would delete approximately $count cache files (scanned in ${elapsed}s)"
+                log "DRY RUN: Would delete approximately $count cache files (scanned in ${elapsed}s)"
+            fi
         else
-            log "Searching for cache files matching: $uri"
+            local removed=0
 
-            # Capture count from stdout (function outputs count, not return code)
-            local removed=$(search_and_delete_cache_files "$uri")
+            # Try O(1) deletion first if we have cache keys
+            if [ -n "$stored_keys" ]; then
+                log "Using O(1) deletion method with collected cache keys..."
+                local start_time=$(date +%s)
+
+                # Delete each cache key
+                IFS=',' read -ra KEYS <<< "$stored_keys"
+                local attempted=0
+                for cache_key in "${KEYS[@]}"; do
+                    if [ -n "$cache_key" ]; then
+                        ((attempted++))
+                        if delete_by_cache_key "$cache_key"; then
+                            ((removed++))
+                        fi
+                    fi
+                done
+
+                local end_time=$(date +%s)
+                local elapsed=$((end_time - start_time))
+                log "O(1) deletion complete in ${elapsed}s: attempted $attempted, removed $removed files"
+
+                # If we didn't find any files via O(1), fall back to O(N) scan
+                if [ "$removed" -eq 0 ]; then
+                    log "WARNING: O(1) deletion found no files - falling back to O(N) scan"
+                    removed=$(search_and_delete_cache_files "$uri")
+                fi
+            else
+                # No cache keys available, use O(N) scan method
+                log "No cache keys available - using O(N) scan method"
+                log "NOTE: To enable O(1) deletion, ensure nginx logs include \$upstream_cache_key"
+
+                removed=$(search_and_delete_cache_files "$uri")
+            fi
 
             log "Remediation complete: removed $removed cache files for: $uri"
 
@@ -321,11 +398,12 @@ main() {
         if [ -f "$LOG_FILE" ]; then
             local suspect_count=0
 
-            # Analyze logs and get problematic URIs
-            while IFS=$'\t' read -r uri error_count error_type; do
+            # Analyze logs and get problematic URIs with cache keys
+            # Output format: uri \t error_count \t error_type \t cache_keys
+            while IFS=$'\t' read -r uri error_count error_type cache_keys; do
                 if [ -n "$uri" ]; then
                     ((suspect_count++))
-                    check_and_remediate "$uri" "$error_count" "$error_type"
+                    check_and_remediate "$uri" "$error_count" "$error_type" "$cache_keys"
                 fi
             done < <(analyze_logs)
 
