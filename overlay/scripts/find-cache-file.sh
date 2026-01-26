@@ -5,8 +5,8 @@
 # Usage: find-cache-file.sh <uri-pattern> [--delete] [--dry-run]
 # Examples:
 #   find-cache-file.sh '/depot/123/chunk'           # Find matching cache files
-#   find-cache-file.sh '/depot/123/chunk' --delete  # Find and delete
-#   find-cache-file.sh '/game/update.zip' --dry-run # Show what would be deleted
+#   find-cache-file.sh '/depot/123/chunk' --delete              # Find and delete
+#   find-cache-file.sh '/game/update.zip' --delete --dry-run   # Show what would be deleted
 
 set -eo pipefail
 
@@ -33,12 +33,12 @@ show_usage() {
     echo ""
     echo "Options:"
     echo "  --delete   Delete matching cache files"
-    echo "  --dry-run  Show what would be deleted without actually deleting"
+    echo "  --dry-run  Show what would be deleted (requires --delete)"
     echo ""
     echo "Examples:"
-    echo "  $0 '/depot/123/chunk/abc'              # Find cache files for this URI"
-    echo "  $0 '/depot/123/chunk/abc' --delete     # Find and delete"
-    echo "  $0 '/origin/game/' --dry-run           # Preview deletion"
+    echo "  $0 '/depot/123/chunk/abc'                      # Find cache files for this URI"
+    echo "  $0 '/depot/123/chunk/abc' --delete             # Find and delete"
+    echo "  $0 '/origin/game/' --delete --dry-run          # Preview deletion"
     echo ""
     echo "Environment variables:"
     echo "  CACHE_DIR      Cache directory (default: /data/cache/cache)"
@@ -222,7 +222,7 @@ else
     echo "To delete these files, run:"
     echo "  $0 '$PATTERN' --delete"
     echo ""
-    echo "To preview deletion:"
+    echo "To preview deletion, run:"
     echo "  $0 '$PATTERN' --delete --dry-run"
 fi
 
