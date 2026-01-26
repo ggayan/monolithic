@@ -90,7 +90,7 @@ print_stats() {
     # Extract last value and handle '-' (no upstream) gracefully
     local slow_requests=$(echo "$recent_lines" | awk '
         {
-            time = $(NF)
+            time = $(NF-1)
             # Extract last numeric value from comma-separated list
             if(match(time, /[0-9.]+$/)) {
                 time = substr(time, RSTART, RLENGTH)
@@ -101,7 +101,7 @@ print_stats() {
     ')
     local very_slow=$(echo "$recent_lines" | awk '
         {
-            time = $(NF)
+            time = $(NF-1)
             if(match(time, /[0-9.]+$/)) {
                 time = substr(time, RSTART, RLENGTH)
                 if(time > 30) count++
